@@ -17,7 +17,7 @@
   var ds = (script && script.dataset) || {};
   var cfg = Object.assign({
     clinicId: ds.clinic || '',
-    endpoint: ds.endpoint || 'https://n8n.appscal.com.br/webhook/f8630e3c-ade7-4de5-8b6e-31705610e831',
+    endpoint: ds.endpoint || 'https://20a0-2804-14d-2a73-448f-9153-62e5-a83a-941e.ngrok-free.app',
     selectors: ds.selectors || '',            // seletores extras de botões, por clínica
     allowEmpty: ds.allowEmpty === 'true',     // envia mesmo sem nome/telefone/email?
     debug: ds.debug === 'true',
