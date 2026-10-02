@@ -1,16 +1,21 @@
-/*! Scal Page Loaded v1.1
+/*! Scal Page Loaded v1.3
  * Instalação:
  * <script src="https://cdn.sistemascal.com.br/lead-tracker/page-loaded.js" async></script>
  *
  * Opcionais na tag:
  *   data-endpoint="https://..."      outro endereço de proxy
- *   data-selector="#whatsapp-button" seletor do botão principal (padrão: #whatsapp-button, depois qualquer link de WhatsApp)
+ *   data-selector="#whatsapp-button" seletor do botão principal
  *   data-clinic="5585..."            reserva, usada só se não houver botão de WhatsApp na página
  *   data-debug="true"                mostra logs no console
  *
- * Ao carregar a página, procura o botão de WhatsApp, lê o número de destino (phone=...)
- * e envia ao proxy um evento com gatilho "page_loaded", a clínica (número do WhatsApp)
- * e todos os parâmetros da URL. A resposta do proxy fica em window.ScalPage.resposta.
+ * 1. Ao carregar a página, envia ao proxy o evento "page_loaded" com a clínica
+ *    (número do WhatsApp do botão) e todos os parâmetros da URL.
+ * 2. O proxy responde { success, protocol_number, hidden_protocol }.
+ * 3. O hidden_protocol (caracteres invisíveis) é colocado no início da mensagem
+ *    de todos os links de WhatsApp da página, inclusive os criados depois (modais)
+ *    e os abertos por window.open.
+ * 4. No clique em WhatsApp, envia ao proxy o evento "whatsapp_click" com o
+ *    protocol_number e o hidden_protocol.
  */
 (function () {
   'use strict';
@@ -24,17 +29,23 @@
     selector: ds.selector || '#whatsapp-button',
     fallbackClinic: ds.clinic || '',
     debug: ds.debug === 'true',
-    waitMs: 10000,           // tempo máximo esperando o botão aparecer
-    timeoutMs: 8000          // tempo máximo esperando a resposta do proxy
+    waitMs: 10000,
+    timeoutMs: 8000
   };
 
-  var api = window.ScalPage = { config: cfg, payload: null, resposta: null, status: null };
+  var api = window.ScalPage = {
+    config: cfg, payload: null, resposta: null, status: null,
+    protocolo: '', protocoloOculto: ''
+  };
 
   function log() {
     if (cfg.debug) console.log.apply(console, ['[Scal]'].concat([].slice.call(arguments)));
   }
 
   var WA_SELECTOR = 'a[href*="api.whatsapp.com"], a[href*="wa.me/"], a[href*="web.whatsapp.com"], a[href^="whatsapp:"]';
+  var WA_URL = /(wa\.me|api\.whatsapp\.com|web\.whatsapp\.com|^whatsapp:)/i;
+  // Caracteres invisíveis usados em protocolos (zero-width space, non-joiner, joiner, word joiner, BOM)
+  var INVISIBLE_PREFIX = /^[\u200B\u200C\u200D\u2060\uFEFF]+/;
 
   function normalizePhone(v) {
     var d = String(v || '').replace(/\D/g, '');
@@ -74,28 +85,133 @@
     return Object.keys(seen);
   }
 
+  // Parâmetros da URL: mantém o primeiro valor e ignora textos não substituídos como {CampaignName}
   function urlParams() {
     var out = {};
     try {
       new URLSearchParams(location.search).forEach(function (val, key) {
-        if (val) out[key] = val.slice(0, 300);
+        if (!val || /^\{[^}]*\}$/.test(val)) return;
+        if (!(key in out)) out[key] = val.slice(0, 300);
       });
     } catch (e) {}
     return out;
   }
 
-  function buildPayload(button) {
-    var href = button ? button.getAttribute('href') : '';
+  // ---------- Protocolo oculto ----------
+  // Coloca o hidden_protocol no início do texto do link (substitui um protocolo invisível anterior, se houver)
+  function injectHidden(url) {
+    if (!api.protocoloOculto || !url || !WA_URL.test(url)) return url;
+    try {
+      var u = new URL(url, location.href);
+      var text = (u.searchParams.get('text') || '').replace(INVISIBLE_PREFIX, '');
+      var novo = api.protocoloOculto + text;
+      if (u.searchParams.get('text') === novo) return url;   // já está aplicado
+      u.searchParams.set('text', novo);
+      return u.toString();
+    } catch (e) {
+      return url;
+    }
+  }
+
+  function applyToLink(a) {
+    var href = a.getAttribute('href');
+    if (!href || !WA_URL.test(href)) return;
+    var novo = injectHidden(href);
+    if (novo !== href) a.setAttribute('href', novo);
+  }
+
+  function applyToAllLinks() {
+    var n = 0;
+    document.querySelectorAll(WA_SELECTOR).forEach(function (a) { applyToLink(a); n++; });
+    log('protocolo oculto aplicado em', n, 'link(s) de WhatsApp');
+  }
+
+  // Links criados ou alterados depois (ex.: modal que monta o link ao escolher a unidade)
+  function watchLinks() {
+    var obs = new MutationObserver(function (mutations) {
+      mutations.forEach(function (m) {
+        if (m.type === 'attributes' && m.target.matches && m.target.matches(WA_SELECTOR)) {
+          applyToLink(m.target);
+        }
+        if (m.type === 'childList') {
+          m.addedNodes.forEach(function (node) {
+            if (node.nodeType !== 1) return;
+            if (node.matches && node.matches(WA_SELECTOR)) applyToLink(node);
+            if (node.querySelectorAll) node.querySelectorAll(WA_SELECTOR).forEach(applyToLink);
+          });
+        }
+      });
+    });
+    obs.observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ['href'] });
+  }
+
+  // ---------- Clique no WhatsApp ----------
+  // Aplica o protocolo no link (caso o site tenha trocado no último instante)
+  // e envia o evento "whatsapp_click" ao proxy.
+  var lastClickAt = 0;
+
+  function sendClick(el, url) {
+    var now = Date.now();
+    if (now - lastClickAt < 1500) return;   // evita duplicar clique + window.open do mesmo gesto
+    lastClickAt = now;
+    var payload = buildPayload('whatsapp_click', el, url);
+    log('enviando whatsapp_click', payload);
+    postClick(payload);
+  }
+
+  document.addEventListener('click', function (e) {
+    var path = e.composedPath ? e.composedPath() : [e.target];
+    for (var i = 0; i < path.length && i < 10; i++) {
+      var el = path[i];
+      if (el && el.nodeType === 1 && el.tagName === 'A' && el.matches(WA_SELECTOR)) {
+        applyToLink(el);
+        sendClick(el, el.getAttribute('href'));
+        return;
+      }
+    }
+  }, true);
+
+  // Sites que abrem o WhatsApp com window.open (botões sem link direto)
+  var nativeOpen = window.open;
+  window.open = function (url) {
+    var args = [].slice.call(arguments);
+    try {
+      if (url && WA_URL.test(String(url))) {
+        args[0] = injectHidden(String(url));
+        sendClick(null, args[0]);
+      }
+    } catch (e) {}
+    return nativeOpen.apply(this, args);
+  };
+
+  function handleResponse(data) {
+    if (!data || typeof data !== 'object') return;
+    if (data.protocol_number) api.protocolo = String(data.protocol_number);
+    if (data.hidden_protocol) {
+      api.protocoloOculto = String(data.hidden_protocol);
+      log('protocolo recebido', api.protocolo, '(oculto com', api.protocoloOculto.length, 'caracteres)');
+      applyToAllLinks();
+      watchLinks();
+    } else {
+      log('resposta sem hidden_protocol; links mantidos como estão');
+    }
+  }
+
+  // ---------- Envio do page_loaded ----------
+  function buildPayload(gatilho, button, hrefOverride) {
+    var href = hrefOverride || (button ? button.getAttribute('href') : '');
     var params = urlParams();
     var payload = {
-      gatilho: 'page_loaded',
+      gatilho: gatilho,
+      protocol_number: api.protocolo,
+      hidden_protocol: api.protocoloOculto,
       clinica: phoneFromLink(href) || normalizePhone(cfg.fallbackClinic) || normalizePhone(params.utm_unidade),
       whatsapp_destino: phoneFromLink(href),
       whatsapp_numeros_pagina: allWhatsappNumbers().join(','),
       unidade: button ? (button.getAttribute('data-unidade') || '') : '',
       botao_id: button ? (button.id || '') : '',
       botao_texto: button ? (button.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 100) : '',
-      mensagem_whatsapp: href ? messageFromLink(href) : '',
+      mensagem_whatsapp: href ? messageFromLink(href).replace(INVISIBLE_PREFIX, '') : '',
       pagina: location.href,
       titulo: document.title,
       referrer: document.referrer,
@@ -107,8 +223,6 @@
     return payload;
   }
 
-  // Envia com fetch para poder ler a resposta do proxy.
-  // Para endereços do ngrok, manda o header que pula a tela de aviso do ngrok gratuito.
   function post(payload) {
     var headers = {};
     if (/ngrok/i.test(cfg.endpoint)) headers['ngrok-skip-browser-warning'] = 'true';
@@ -132,20 +246,39 @@
         try { data = JSON.parse(text); } catch (e) {}
         api.resposta = data;
         log('proxy respondeu', api.status, data);
+        handleResponse(data);
         return data;
       })
       .catch(function (e) {
         if (timer) clearTimeout(timer);
-        log('falha no fetch, tentando sendBeacon', e && e.message);
-        try { navigator.sendBeacon && navigator.sendBeacon(cfg.endpoint, new URLSearchParams(payload)); } catch (err) {}
+        log('falha ao falar com o proxy', e && e.message);
       });
+  }
+
+  // Envio do clique: fetch com keepalive (continua mesmo se a página sair);
+  // se o navegador recusar, usa sendBeacon.
+  function postClick(payload) {
+    var body = new URLSearchParams(payload);
+    var headers = {};
+    if (/ngrok/i.test(cfg.endpoint)) headers['ngrok-skip-browser-warning'] = 'true';
+    try {
+      fetch(cfg.endpoint, { method: 'POST', headers: headers, body: body, keepalive: true })
+        .then(function (r) { log('proxy respondeu ao clique', r.status); })
+        .catch(function () {
+          try { navigator.sendBeacon && navigator.sendBeacon(cfg.endpoint, new URLSearchParams(payload)); } catch (e) {}
+        });
+    } catch (e) {
+      try { navigator.sendBeacon && navigator.sendBeacon(cfg.endpoint, body); } catch (err) {}
+    }
   }
 
   var sent = false;
   function send(button) {
     if (sent) return;
     sent = true;
-    var payload = buildPayload(button);
+    var payload = buildPayload('page_loaded', button);
+    delete payload.protocol_number;   // ainda não existe protocolo no carregamento
+    delete payload.hidden_protocol;
     api.payload = payload;
     if (!payload.clinica) log('nenhum botão de WhatsApp encontrado; enviando sem clínica');
     log('enviando page_loaded', payload);
