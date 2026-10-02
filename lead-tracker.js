@@ -1,243 +1,170 @@
-/*! Lead Tracker WhatsApp v1.0
+/*! Scal Page Loaded v1.1
  * Instalação:
- * <script src="https://cdn.seusistema.com/lead-tracker.js"
- *         data-clinic="ID_DA_CLINICA"
- *         data-endpoint="https://api.seusistema.com/leads"
- *         data-selectors=".btn-agendar, #meu-botao"   (opcional)
- *         data-debug="true"                            (opcional)
- *         async></script>
+ * <script src="https://cdn.sistemascal.com.br/lead-tracker/page-loaded.js" async></script>
+ *
+ * Opcionais na tag:
+ *   data-endpoint="https://..."      outro endereço de proxy
+ *   data-selector="#whatsapp-button" seletor do botão principal (padrão: #whatsapp-button, depois qualquer link de WhatsApp)
+ *   data-clinic="5585..."            reserva, usada só se não houver botão de WhatsApp na página
+ *   data-debug="true"                mostra logs no console
+ *
+ * Ao carregar a página, procura o botão de WhatsApp, lê o número de destino (phone=...)
+ * e envia ao proxy um evento com gatilho "page_loaded", a clínica (número do WhatsApp)
+ * e todos os parâmetros da URL. A resposta do proxy fica em window.ScalPage.resposta.
  */
 (function () {
   'use strict';
-  if (window.__leadTrackerLoaded) return;
-  window.__leadTrackerLoaded = true;
+  if (window.__scalPageLoaded) return;
+  window.__scalPageLoaded = true;
 
-  // ---------- Configuração ----------
-  var script = document.currentScript || document.querySelector('script[data-clinic]');
+  var script = document.currentScript || document.querySelector('script[src*="page-loaded"]');
   var ds = (script && script.dataset) || {};
-  var cfg = Object.assign({
-    clinicId: ds.clinic || '',
-    endpoint: ds.endpoint || 'https://20a0-2804-14d-2a73-448f-9153-62e5-a83a-941e.ngrok-free.app',
-    selectors: ds.selectors || '',            // seletores extras de botões, por clínica
-    allowEmpty: ds.allowEmpty === 'true',     // envia mesmo sem nome/telefone/email?
+  var cfg = {
+    endpoint: ds.endpoint || 'https://11f4-2804-14d-2a73-448f-bc41-7b89-9ecb-c670.ngrok-free.app',
+    selector: ds.selector || '#whatsapp-button',
+    fallbackClinic: ds.clinic || '',
     debug: ds.debug === 'true',
-    dedupeMs: 30000,                          // não reenvia o mesmo lead em 30s
-    pendingMs: 15000                          // janela após submit para detectar redirecionamento
-  }, window.LeadTrackerConfig || {});
+    waitMs: 10000,           // tempo máximo esperando o botão aparecer
+    timeoutMs: 8000          // tempo máximo esperando a resposta do proxy
+  };
+
+  var api = window.ScalPage = { config: cfg, payload: null, resposta: null, status: null };
 
   function log() {
-    if (cfg.debug) console.log.apply(console, ['[LeadTracker]'].concat([].slice.call(arguments)));
-  }
-  if (!cfg.clinicId) { console.warn('[LeadTracker] data-clinic ausente, script desativado'); return; }
-
-  // ---------- Detecção de WhatsApp ----------
-  var WA_URL = /(wa\.me|api\.whatsapp\.com|web\.whatsapp\.com|^whatsapp:)/i;
-  var WA_HINT = /whats|wpp|zap/i;
-  var CLICKABLE = 'a,button,input[type=submit],input[type=button],[role=button],[onclick]';
-
-  function waHref(el) {
-    var href = el.getAttribute('href') || el.getAttribute('data-href') || el.getAttribute('formaction') || '';
-    if (WA_URL.test(href)) return href;
-    var oc = el.getAttribute('onclick') || '';
-    var m = oc.match(/(https?:\/\/)?(wa\.me|api\.whatsapp\.com|web\.whatsapp\.com)[^'"\s)]*/i);
-    return m ? m[0] : '';
+    if (cfg.debug) console.log.apply(console, ['[Scal]'].concat([].slice.call(arguments)));
   }
 
-  function safeMatches(el, sel) {
-    try { return !!sel && el.matches(sel); } catch (e) { return false; }
-  }
+  var WA_SELECTOR = 'a[href*="api.whatsapp.com"], a[href*="wa.me/"], a[href*="web.whatsapp.com"], a[href^="whatsapp:"]';
 
-  function isTrigger(el) {
-    if (safeMatches(el, cfg.selectors)) return true;
-    if (!safeMatches(el, CLICKABLE)) return false;
-    if (waHref(el)) return true;
-    var cls = typeof el.className === 'string' ? el.className : (el.className && el.className.baseVal) || '';
-    var hint = [el.id, cls, el.getAttribute('aria-label'), el.title, el.value, (el.textContent || '').slice(0, 80)].join(' ');
-    return WA_HINT.test(hint);
-  }
-
-  // ---------- Extração dos dados do formulário ----------
-  function labelText(el) {
-    var t = '';
-    try {
-      if (el.id) {
-        var l = document.querySelector('label[for="' + CSS.escape(el.id) + '"]');
-        if (l) t += l.textContent;
-      }
-    } catch (e) {}
-    var p = el.closest('label');
-    if (p) t += ' ' + p.textContent;
-    return t;
-  }
-
-  function classify(el) {
-    var type = (el.type || '').toLowerCase();
-    var ac = (el.getAttribute('autocomplete') || '').toLowerCase();
-    if (type === 'email' || ac === 'email') return 'email';
-    if (type === 'tel' || ac.indexOf('tel') === 0) return 'phone';
-    var hay = [el.name, el.id, el.placeholder, ac, el.getAttribute('aria-label'), labelText(el)].join(' ');
-    if (/e-?mail/i.test(hay)) return 'email';
-    if (/tel|fone|phone|celular|whats|wpp|mobile/i.test(hay)) return 'phone';
-    if (/nome|name/i.test(hay)) return 'name';
-    return null;
-  }
-
-  function extract(container) {
-    var d = { name: '', phone: '', email: '', fields: {} };
-    if (!container) return d;
-    container.querySelectorAll('input, select, textarea').forEach(function (el, i) {
-      var type = (el.type || '').toLowerCase();
-      if (['password', 'submit', 'button', 'file', 'image', 'reset'].indexOf(type) > -1) return;
-      if ((type === 'checkbox' || type === 'radio') && !el.checked) return;
-      var val = (el.value || '').trim();
-      if (!val) return;
-      d.fields[el.name || el.id || ('campo_' + i)] = val.slice(0, 500);
-      if (type === 'hidden') return;
-      var kind = classify(el);
-      if (kind && !d[kind]) d[kind] = val;
-    });
+  function normalizePhone(v) {
+    var d = String(v || '').replace(/\D/g, '');
+    if (d.length === 10 || d.length === 11) d = '55' + d;
     return d;
   }
 
-  function hasData(d) { return !!(d.name || d.phone || d.email); }
-
-  // Encontra o "formulário" mesmo quando não existe <form> (landing pages com divs)
-  function findContainer(el) {
-    if (!el || !el.closest) return null;
-    var form = el.closest('form');
-    if (form) return form;
-    var node = el.parentElement;
-    for (var i = 0; node && i < 6; i++, node = node.parentElement) {
-      if (node.querySelector('input, textarea')) return node;
-    }
-    return null;
+  function phoneFromLink(href) {
+    if (!href) return '';
+    try {
+      var u = new URL(href, location.href);
+      var p = u.searchParams.get('phone');
+      if (p) return normalizePhone(p);
+      if (/wa\.me$/i.test(u.hostname)) return normalizePhone(u.pathname);
+    } catch (e) {}
+    var m = String(href).match(/phone=([\d+\s-]+)/i) || String(href).match(/wa\.me\/(\d+)/i);
+    return m ? normalizePhone(m[1]) : '';
   }
 
-  // Guarda o último formulário que o usuário preencheu (para botões flutuantes fora do form)
-  var lastContainer = null;
-  document.addEventListener('input', function (e) {
-    var c = findContainer(e.target);
-    if (c) lastContainer = c;
-  }, true);
+  function messageFromLink(href) {
+    try { return new URL(href, location.href).searchParams.get('text') || ''; } catch (e) { return ''; }
+  }
 
-  // ---------- Atribuição (UTMs persistem entre páginas na sessão) ----------
-  var ATTR_KEYS = ['utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content', 'gclid', 'fbclid', 'gbraid', 'wbraid'];
-  function attribution() {
-    var out = {}, stored = {};
-    try { stored = JSON.parse(sessionStorage.getItem('__lt_attr') || '{}'); } catch (e) {}
-    var p = new URLSearchParams(location.search);
-    ATTR_KEYS.forEach(function (k) { if (p.get(k)) out[k] = p.get(k); });
-    out = Object.assign(stored, out);
-    try { sessionStorage.setItem('__lt_attr', JSON.stringify(out)); } catch (e) {}
+  function findButton() {
+    var el = null;
+    try { el = document.querySelector(cfg.selector); } catch (e) {}
+    if (el && phoneFromLink(el.getAttribute('href'))) return el;
+    return document.querySelector(WA_SELECTOR);
+  }
+
+  function allWhatsappNumbers() {
+    var seen = {};
+    document.querySelectorAll(WA_SELECTOR).forEach(function (a) {
+      var p = phoneFromLink(a.getAttribute('href'));
+      if (p) seen[p] = true;
+    });
+    return Object.keys(seen);
+  }
+
+  function urlParams() {
+    var out = {};
+    try {
+      new URLSearchParams(location.search).forEach(function (val, key) {
+        if (val) out[key] = val.slice(0, 300);
+      });
+    } catch (e) {}
     return out;
   }
-  attribution(); // salva já no carregamento
 
-  function waMessage(url) {
-    try { return new URL(url, location.href).searchParams.get('text') || ''; } catch (e) { return ''; }
-  }
-
-  // ---------- Envio ----------
-  var sentAt = {};
-  function send(trigger, container, waUrl, manual) {
-    var d = manual || extract(container);
-    if (!hasData(d) && !cfg.allowEmpty) { log('sem dados de contato, ignorado', trigger); return false; }
-
-    var key = [d.name, d.phone, d.email].join('|');
-    var now = Date.now();
-    if (sentAt[key] && now - sentAt[key] < cfg.dedupeMs) { log('duplicado, ignorado'); return false; }
-    sentAt[key] = now;
-
-    var attr = attribution();
+  function buildPayload(button) {
+    var href = button ? button.getAttribute('href') : '';
+    var params = urlParams();
     var payload = {
-      clinica: cfg.clinicId,
-      nome: d.name || '',
-      telefone: (d.phone || '').replace(/\D/g, ''),
-      email: d.email || '',
-      utm_source: attr.utm_source || '',
-      utm_medium: attr.utm_medium || '',
-      utm_campaign: attr.utm_campaign || '',
-      utm_term: attr.utm_term || '',
-      utm_content: attr.utm_content || '',
-      gclid: attr.gclid || '',
-      fbclid: attr.fbclid || '',
-      gatilho: trigger,
-      mensagem_whatsapp: waUrl ? waMessage(waUrl) : '',
+      gatilho: 'page_loaded',
+      clinica: phoneFromLink(href) || normalizePhone(cfg.fallbackClinic) || normalizePhone(params.utm_unidade),
+      whatsapp_destino: phoneFromLink(href),
+      whatsapp_numeros_pagina: allWhatsappNumbers().join(','),
+      unidade: button ? (button.getAttribute('data-unidade') || '') : '',
+      botao_id: button ? (button.id || '') : '',
+      botao_texto: button ? (button.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 100) : '',
+      mensagem_whatsapp: href ? messageFromLink(href) : '',
       pagina: location.href,
+      titulo: document.title,
       referrer: document.referrer,
       data_hora: new Date().toISOString()
     };
-    log('enviando lead', payload);
-
-    // urlencoded: o n8n já entrega como campos em $json.body e não exige preflight CORS.
-    // sendBeacon continua o envio mesmo quando a página redireciona pro WhatsApp.
-    var body = new URLSearchParams(payload);
-    var ok = false;
-    try { ok = navigator.sendBeacon && navigator.sendBeacon(cfg.endpoint, body); } catch (e) {}
-    if (!ok) {
-      try {
-        fetch(cfg.endpoint, { method: 'POST', body: body, keepalive: true, mode: 'no-cors' })
-          .catch(function () {});
-      } catch (e) {}
-    }
-    return true;
+    Object.keys(params).forEach(function (k) {
+      if (!(k in payload)) payload[k] = params[k];
+    });
+    return payload;
   }
 
-  // ---------- Gatilho 1: clique em qualquer botão/link de WhatsApp ----------
-  document.addEventListener('click', function (e) {
-    var path = e.composedPath ? e.composedPath() : [e.target];
-    for (var i = 0; i < path.length && i < 10; i++) {
-      var el = path[i];
-      if (!el || el.nodeType !== 1) continue;
-      if (isTrigger(el)) {
-        var container = findContainer(el) || lastContainer;
-        // Se for submit de um form inválido, o navegador vai bloquear: não conta
-        if (container && container.tagName === 'FORM' && el.type === 'submit' &&
-            container.checkValidity && !container.checkValidity()) return;
-        send('whatsapp_click', container, waHref(el));
-        return;
-      }
-    }
-  }, true);
+  // Envia com fetch para poder ler a resposta do proxy.
+  // Para endereços do ngrok, manda o header que pula a tela de aviso do ngrok gratuito.
+  function post(payload) {
+    var headers = {};
+    if (/ngrok/i.test(cfg.endpoint)) headers['ngrok-skip-browser-warning'] = 'true';
 
-  // ---------- Gatilho 2: form enviado que redireciona via JS ----------
-  var pending = null;
-  document.addEventListener('submit', function (e) {
-    var d = extract(e.target);
-    if (hasData(d)) { pending = { container: e.target, at: Date.now() }; log('submit pendente'); }
-  }, true);
+    var ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    var timer = ctrl ? setTimeout(function () { ctrl.abort(); }, cfg.timeoutMs) : null;
 
-  function flushPending(trigger, url) {
-    if (pending && Date.now() - pending.at < cfg.pendingMs) {
-      send(trigger, pending.container, url);
-      pending = null;
-      return true;
-    }
-    return false;
+    return fetch(cfg.endpoint, {
+      method: 'POST',
+      headers: headers,
+      body: new URLSearchParams(payload),
+      signal: ctrl ? ctrl.signal : undefined
+    })
+      .then(function (r) {
+        api.status = r.status;
+        return r.text();
+      })
+      .then(function (text) {
+        if (timer) clearTimeout(timer);
+        var data = text;
+        try { data = JSON.parse(text); } catch (e) {}
+        api.resposta = data;
+        log('proxy respondeu', api.status, data);
+        return data;
+      })
+      .catch(function (e) {
+        if (timer) clearTimeout(timer);
+        log('falha no fetch, tentando sendBeacon', e && e.message);
+        try { navigator.sendBeacon && navigator.sendBeacon(cfg.endpoint, new URLSearchParams(payload)); } catch (err) {}
+      });
   }
 
-  // Sites que fazem window.open('https://wa.me/...')
-  var nativeOpen = window.open;
-  window.open = function (url) {
-    try {
-      if (url && WA_URL.test(String(url))) {
-        if (!flushPending('form_submit_whatsapp', String(url))) send('whatsapp_open', lastContainer, String(url));
-      }
-    } catch (e) {}
-    return nativeOpen.apply(this, arguments);
-  };
+  var sent = false;
+  function send(button) {
+    if (sent) return;
+    sent = true;
+    var payload = buildPayload(button);
+    api.payload = payload;
+    if (!payload.clinica) log('nenhum botão de WhatsApp encontrado; enviando sem clínica');
+    log('enviando page_loaded', payload);
+    post(payload);
+  }
 
-  // Sites que fazem location.href = 'https://wa.me/...' (não interceptável; pega na saída da página)
-  window.addEventListener('pagehide', function () { flushPending('form_submit_leave'); });
-  document.addEventListener('visibilitychange', function () {
-    if (document.visibilityState === 'hidden') flushPending('form_submit_leave');
-  });
+  function start() {
+    var button = findButton();
+    if (button) { send(button); return; }
 
-  // ---------- API manual (para sites com integração customizada) ----------
-  window.LeadTracker = {
-    track: function (data) { return send('manual', null, (data && data.whatsappUrl) || '', data || {}); },
-    config: cfg
-  };
+    log('botão de WhatsApp ainda não encontrado, aguardando...');
+    var observer = new MutationObserver(function () {
+      var b = findButton();
+      if (b) { observer.disconnect(); clearTimeout(timer); send(b); }
+    });
+    observer.observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ['href'] });
+    var timer = setTimeout(function () { observer.disconnect(); send(null); }, cfg.waitMs);
+  }
 
-  log('ativo para clínica', cfg.clinicId);
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start);
+  else start();
 })();
