@@ -1,4 +1,4 @@
-/*! Scal Page Loaded v1.3
+/*! Scal Page Loaded v1.4
  * Instalação:
  * <script src="https://cdn.sistemascal.com.br/lead-tracker/page-loaded.js" async></script>
  *
@@ -45,7 +45,15 @@
   var WA_SELECTOR = 'a[href*="api.whatsapp.com"], a[href*="wa.me/"], a[href*="web.whatsapp.com"], a[href^="whatsapp:"]';
   var WA_URL = /(wa\.me|api\.whatsapp\.com|web\.whatsapp\.com|^whatsapp:)/i;
   // Caracteres invisíveis usados em protocolos (zero-width space, non-joiner, joiner, word joiner, BOM)
-  var INVISIBLE_PREFIX = /^[\u200B\u200C\u200D\u2060\uFEFF]+/;
+  var INVISIBLE_BLOCK = /[\u200B\u200C\u200D\u2060\uFEFF]+/g;
+  var PROTOCOL_LABEL = 'Protocolo de atendimento: ';
+  // Linha de protocolo injetada pelo script (para não duplicar ao reaplicar)
+  var PROTOCOL_LINE = /^Protocolo de atendimento:[^\n]*\n/;
+
+  // Remove o que o script injetou: a linha do protocolo visível e os caracteres invisíveis
+  function cleanMessage(text) {
+    return String(text || '').replace(INVISIBLE_BLOCK, '').replace(PROTOCOL_LINE, '');
+  }
 
   function normalizePhone(v) {
     var d = String(v || '').replace(/\D/g, '');
@@ -97,17 +105,37 @@
     return out;
   }
 
-  // ---------- Protocolo oculto ----------
-  // Coloca o hidden_protocol no início do texto do link (substitui um protocolo invisível anterior, se houver)
+  // ---------- Protocolo ----------
+  // A mensagem fica assim:
+  //   Protocolo de atendimento: GAAB7H
+  //   <protocolo invisível>Olá! Vim pelo site...
+  // O protocolo visível é a garantia: se o WhatsApp descartar os invisíveis,
+  // o número continua legível no texto.
+  function buildMessage(original) {
+    var rest = cleanMessage(original) || 'Olá!';
+    return PROTOCOL_LABEL + api.protocolo + '\n' + api.protocoloOculto + rest;
+  }
+
+  // Monta a URL com encodeURIComponent (espaço vira %20, e não +, que alguns aparelhos mostram literalmente)
+  function withText(url, text) {
+    var u = new URL(url, location.href);
+    var parts = [];
+    u.searchParams.forEach(function (val, key) {
+      if (key !== 'text') parts.push(encodeURIComponent(key) + '=' + encodeURIComponent(val));
+    });
+    parts.push('text=' + encodeURIComponent(text));
+    return u.origin === 'null' || u.protocol === 'whatsapp:'
+      ? u.protocol + '//' + u.host + u.pathname + '?' + parts.join('&')
+      : u.origin + u.pathname + '?' + parts.join('&') + u.hash;
+  }
+
   function injectHidden(url) {
-    if (!api.protocoloOculto || !url || !WA_URL.test(url)) return url;
+    if (!api.protocolo || !url || !WA_URL.test(url)) return url;
     try {
-      var u = new URL(url, location.href);
-      var text = (u.searchParams.get('text') || '').replace(INVISIBLE_PREFIX, '');
-      var novo = api.protocoloOculto + text;
-      if (u.searchParams.get('text') === novo) return url;   // já está aplicado
-      u.searchParams.set('text', novo);
-      return u.toString();
+      var current = new URL(url, location.href).searchParams.get('text') || '';
+      var novo = buildMessage(current);
+      if (current === novo) return url;   // já está aplicado
+      return withText(url, novo);
     } catch (e) {
       return url;
     }
@@ -184,16 +212,31 @@
     return nativeOpen.apply(this, args);
   };
 
+  // Aceita a resposta em formatos diferentes que o n8n pode devolver:
+  // { ... }, [ { ... } ], { json: { ... } }, { body: { ... } } ou { data: { ... } }
+  function unwrap(data) {
+    for (var i = 0; i < 4 && data; i++) {
+      if (Array.isArray(data)) { data = data[0]; continue; }
+      if (typeof data === 'object' && !data.hidden_protocol) {
+        var inner = data.json || data.body || data.data;
+        if (inner && typeof inner === 'object') { data = inner; continue; }
+      }
+      break;
+    }
+    return data;
+  }
+
   function handleResponse(data) {
-    if (!data || typeof data !== 'object') return;
-    if (data.protocol_number) api.protocolo = String(data.protocol_number);
-    if (data.hidden_protocol) {
-      api.protocoloOculto = String(data.hidden_protocol);
+    data = unwrap(data);
+    if (!data || typeof data !== 'object') { log('resposta do proxy não é JSON:', data); return; }
+    if (data.hidden_protocol) api.protocoloOculto = String(data.hidden_protocol);
+    if (data.protocol_number) {
+      api.protocolo = String(data.protocol_number);
       log('protocolo recebido', api.protocolo, '(oculto com', api.protocoloOculto.length, 'caracteres)');
       applyToAllLinks();
       watchLinks();
     } else {
-      log('resposta sem hidden_protocol; links mantidos como estão');
+      log('resposta sem protocol_number; links mantidos como estão');
     }
   }
 
@@ -211,7 +254,7 @@
       unidade: button ? (button.getAttribute('data-unidade') || '') : '',
       botao_id: button ? (button.id || '') : '',
       botao_texto: button ? (button.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 100) : '',
-      mensagem_whatsapp: href ? messageFromLink(href).replace(INVISIBLE_PREFIX, '') : '',
+      mensagem_whatsapp: href ? cleanMessage(messageFromLink(href)) : '',
       pagina: location.href,
       titulo: document.title,
       referrer: document.referrer,
